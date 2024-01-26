@@ -68,17 +68,20 @@ create proc rpl.spGetCurrentTimestamp (@rv varchar(20) output)
 as
 	declare @rv_bin varbinary(8)
 		, @Minutes int
+	set @rv_bin = @@dbts
 	
+	/*
 	--here we get the rv about 1 minute ago, in a form to delay the subscribers.
 	--this is an attempt to prevent gaps, which we suspect are caused by the fact that the publisher may already have generated some RV values, but they were not yet available for reads when the subscription ran.
 
 	select top 1 @rv_bin = rv, @Minutes = datediff(mi, date, getdate()) 
 	from rpl.Dates
-	where date < dateadd(ss, -15, getdate())--force a delay to make sure RV was released
+	where date < dateadd(ss, -1, getdate())--force a delay to make sure RV was released
 	order by date desc
 	
 	if @Minutes > 60 --date is too old, probably the job that inserts stopped running
 		 set @rv_bin = @@dbts
+	*/
 
 	set @rv = convert(varchar, @rv_bin, 1)
 go
@@ -197,8 +200,6 @@ declare @sql varchar(max)
 	, @ProcName varchar(100)=''
 	, @IsCustom bit
 	, @IsNew bit=1
-	, @RvColumnName varchar(100)=''
-	, @RvColumnType varchar(100)=''
 
 if not exists (select * from sys.objects t
 			inner join sys.schemas s on t.schema_id = s.schema_id
@@ -273,36 +274,14 @@ begin try
 		return(0)
 	end
 
-	select @RvColumnName = c.name 
-		from sys.objects t
-		join sys.schemas s on t.schema_id = s.schema_id
-		join sys.columns c on c.[object_id] = t.[object_id] 
-		inner join sys.types ty on ty.user_type_id = c.user_type_id and ty.name in ('timestamp','rowversion')
-		where s.Name = @SchemaName 
-		and t.Name = @TableName
-
-	select @RvColumnType = ty.name 
-		from sys.objects t
-		join sys.schemas s on t.schema_id = s.schema_id
-		join sys.columns c on c.[object_id] = t.[object_id] and c.name = 'rv'
-		inner join sys.types ty on ty.user_type_id = c.user_type_id 
-		where s.Name = @SchemaName 
-		and t.Name = @TableName
-
-	if @RvColumnType not in ('', 'timestamp','rowversion')
-	begin
-		set @sql = 'Table '+@SchemaName+'.'+@TableName+' already has column [rv] of type ['+@RvColumnType+'], please rename this column, the column name rv must be reverved for mSync!'
-		raiserror (@sql,16,1)
-		return(0)
-	end
-	else if @RvColumnName = '' and @RvColumnType = ''
+--ADD RV COLUMN
+	if not exists (select * from sys.objects t
+				join sys.schemas s on t.schema_id = s.schema_id
+				join sys.columns c on c.[object_id] = t.[object_id] and c.name = 'rv'
+				where s.Name = @SchemaName 
+				and t.Name = @TableName)
 	begin
 		set @sql = 'alter table ['+@SchemaName+'].['+@TableName+'] add rv rowversion ' 
-		exec spExec @sql, @debug, @exec
-	end
-	else if @RvColumnName <> '' and @RvColumnType = ''
-	begin--there is already a column of type rowversion and name other than RV, so we create an alias to the existing column with name RV
-		set @sql = 'alter table ['+@SchemaName+'].['+@TableName+'] add rv as ['+@TimestampColumn+'] ' 
 		exec spExec @sql, @debug, @exec
 	end
 
@@ -445,14 +424,14 @@ declare @rvfrom_bin varbinary(8) = convert(varbinary(8), @rvfrom, 1), @rvto_bin 
 if @rvfrom_bin = 0x
 BEGIN
 	select ''I'' as RplOperation, '+@Columns+', rv as sourcerv
-	from ['+@SchemaName+'].['+@TableName+'] /*with (nolock)*/ --here we use dirty reads to prevent long locks during initialization, but we risk skiping rows due ghost reads, or raising PK violations due to row movement
+	from ['+@SchemaName+'].['+@TableName+'] /*with (nolock)*/ --here we may use dirty reads to prevent long locks during initialization, but we risk skiping rows due ghost reads, or raising PK violations due to row movement
 	where [rv] <= @rvto_bin
 END
 ELSE
 BEGIN
 	;with a as (
 		select ''U'' as RplOperation, '+@ColumnsWithCompression+', rv as sourcerv
-		from ['+@SchemaName+'].['+@TableName+'] with (serializable, forceseek)--here we need to read committed, no nolock, we force seek because sql sometimes choses CI scan, and we dont want that
+		from ['+@SchemaName+'].['+@TableName+'] with (forceseek)--we force seek because sql sometimes choses CI scan
 		where rv > @rvfrom_bin and rv <= @rvto_bin
 		union all
 		select ''D'' as RplOperation, '+@DeleteColumns+', rv as sourcerv
